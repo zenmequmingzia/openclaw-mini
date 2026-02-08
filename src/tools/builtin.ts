@@ -290,23 +290,20 @@ export const execTool: Tool<{ command: string; timeout?: number }> = {
 /**
  * 列出目录工具
  *
- * 为什么限制 100 条？
- * - 目录可能包含数千个文件（如 node_modules）
- * - 100 条足够了解目录结构
- * - 如果需要更多，LLM 可以进入子目录查看
- *
- * 为什么用 📁 📄 图标？
- * - 帮助 LLM 快速区分文件和目录
- * - 视觉上更清晰
+ * 对应 OpenClaw: pi-coding-agent/core/tools/ls.ts
+ * - 只接受 path 和 limit，不接受 pattern
+ * - glob 过滤是 find 工具（委托 fd）的职责，ls 保持职责单一
+ * - 按字母排序，目录用 / 后缀标记
+ * - 限制条目数，防止 node_modules 等大目录打爆上下文
  */
-export const listTool: Tool<{ path?: string; pattern?: string }> = {
+export const listTool: Tool<{ path?: string; limit?: number }> = {
   name: "list",
-  description: "列出目录内容",
+  description: "列出目录内容（按字母排序，目录以 / 结尾）",
   inputSchema: {
     type: "object",
     properties: {
       path: { type: "string", description: "目录路径，默认当前目录" },
-      pattern: { type: "string", description: "过滤模式，如 *.ts" },
+      limit: { type: "number", description: "最大条目数，默认 500" },
     },
   },
   async execute(input, ctx) {
@@ -322,20 +319,25 @@ export const listTool: Tool<{ path?: string; pattern?: string }> = {
       return `错误: ${(err as Error).message}`;
     }
 
+    const limit = input.limit ?? 500;
+
     try {
       const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
-      // 简单的通配符转正则
-      const pattern = input.pattern
-        ? new RegExp(input.pattern.replace(/\*/g, ".*"))
-        : null;
+      // 按字母排序（大小写不敏感），对齐 openclaw 的 ls 工具
+      const sorted = entries
+        .slice()
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
 
-      const result = entries
-        .filter((e) => !pattern || pattern.test(e.name))
-        .map((e) => `${e.isDirectory() ? "📁" : "📄"} ${e.name}`)
-        .slice(0, 100); // 最多 100 条
+      const lines = sorted
+        .slice(0, limit)
+        .map((e) => e.isDirectory() ? `${e.name}/` : e.name);
 
-      return result.join("\n") || "目录为空";
+      if (sorted.length > limit) {
+        lines.push(`\n[已截断，共 ${sorted.length} 项，仅显示前 ${limit} 项]`);
+      }
+
+      return lines.join("\n") || "目录为空";
     } catch (err) {
       return `错误: ${(err as Error).message}`;
     }
