@@ -1,55 +1,47 @@
 /**
- * 可扩展 Skills 系统
+ * Skill 编排层（对应 OpenClaw src/agents/skills/）
  *
- * 对应 OpenClaw:
- * - src/agents/skills/types.ts → 类型定义
- * - src/agents/skills/workspace.ts → 加载/合并/prompt 生成
- * - src/agents/skills/frontmatter.ts → YAML frontmatter 解析
- * - src/agents/skills/config.ts → eligibility 过滤
- * - src/auto-reply/skill-commands.ts → /command 匹配
- * - pi-coding-agent/core/skills.ts → loadSkillsFromDir, formatSkillsForPrompt
+ * 在 skill-primitives（SDK 层）之上构建，只做 SDK 不提供的编排和策略:
+ * - 多层目录加载与合并 (managed < workspace)
+ * - Frontmatter 元数据提取（SDK 之外的字段）
+ * - 调用策略解析 (userInvocable / disableModelInvocation)
+ * - /command 斜杠命令匹配
+ * - 命令名 sanitize + 去重
+ * - SkillManager 公开 API
  *
- * 核心设计:
- * 1. SKILL.md 文件格式 (YAML frontmatter + markdown body)
- * 2. 多层目录加载，后加载的覆盖先加载的 (managed < workspace)
- *    OpenClaw 有 5 层 (extra < plugin < bundled < managed < workspace)，mini 简化为 2 层
- * 3. /skillname args 斜杠命令触发
- * 4. XML 格式 prompt 注入 (Agent Skills 标准: https://agentskills.io)
- * 5. 模型通过 read 工具按需加载 SKILL.md 详细指令
+ * 分层对应关系:
+ *   OpenClaw workspace.ts:1-5 →
+ *     import { formatSkillsForPrompt, loadSkillsFromDir, type Skill } from "@mariozechner/pi-coding-agent"
+ *   Mini skills.ts:下方 →
+ *     import { type Skill, loadSkillsFromDir, formatSkillsForPrompt } from "./skill-primitives.js"
+ *
+ * 即: SDK 提供原语，编排层做策略。
  */
 
 import fs from "node:fs/promises";
-import type { Dirent } from "node:fs";
 import path from "node:path";
 
-// ============== 类型定义 (对齐 openclaw types.ts) ==============
-
 /**
- * Skill 定义
+ * 底层原语来自 skill-primitives（对应 pi-coding-agent SDK）
  *
- * 对应 pi-coding-agent: Skill 接口
- * - name 是唯一标识（对应目录名或 frontmatter name）
- * - filePath 指向 SKILL.md 绝对路径，模型可通过 read 工具按需读取
+ * OpenClaw 对应: import { ... } from "@mariozechner/pi-coding-agent"
  */
-export interface Skill {
-  /** 技能名称（唯一标识，对应目录名或 frontmatter name） */
-  name: string;
-  /** 人类可读描述（注入到 prompt，告诉模型何时使用） */
-  description: string;
-  /** SKILL.md 文件绝对路径（模型可 read 该文件获取详细指令） */
-  filePath: string;
-  /** 技能所在目录 */
-  baseDir: string;
-  /** 来源标识: "managed" | "workspace"（workspace 覆盖 managed） */
-  source: string;
-  /** 是否禁止模型主动调用（true = 仅 /command 触发，不注入 prompt） */
-  disableModelInvocation: boolean;
-}
+import {
+  type Skill,
+  loadSkillsFromDir,
+  formatSkillsForPrompt,
+} from "./skill-primitives.js";
+
+// Re-export SDK 类型供外部使用
+export type { Skill };
+
+// ============== 类型定义 (对应 openclaw types.ts) ==============
 
 /**
  * 解析后的 frontmatter 键值对
  *
- * 对应 OpenClaw: ParsedSkillFrontmatter = Record<string, string>
+ * 对应 OpenClaw: ParsedSkillFrontmatter
+ * 所有值都被强制转为 string（对齐 openclaw 的 coercion 策略）
  */
 export type ParsedSkillFrontmatter = Record<string, string>;
 
@@ -57,6 +49,9 @@ export type ParsedSkillFrontmatter = Record<string, string>;
  * Skill 调用策略
  *
  * 对应 OpenClaw: SkillInvocationPolicy
+ * 两个布尔值独立控制两条触发通道:
+ * - userInvocable 控制用户 /command 通道
+ * - disableModelInvocation 控制模型自主触发通道
  */
 export type SkillInvocationPolicy = {
   /** 用户是否可通过 /command 调用 */
@@ -69,17 +64,24 @@ export type SkillInvocationPolicy = {
  * 加载后的完整 skill 条目
  *
  * 对应 OpenClaw: SkillEntry
+ * - skill 字段来自 SDK 的 loadSkillsFromDir（底层原语）
+ * - frontmatter/invocation 由编排层重读文件后提取（SDK 不关心这些字段）
  */
 export type SkillEntry = {
+  /** SDK 返回的 Skill 对象（name/description/filePath/baseDir/source） */
   skill: Skill;
+  /** 编排层解析的完整 frontmatter 键值对 */
   frontmatter: ParsedSkillFrontmatter;
+  /** 调用策略（控制用户 /command 和模型自主调用两个通道） */
   invocation: SkillInvocationPolicy;
 };
 
 /**
- * Skill 命令规格（斜杠命令）
+ * Skill 命令规格（斜杠命令注册条目）
  *
  * 对应 OpenClaw: SkillCommandSpec
+ * 由 buildSkillCommandSpecs() 从 SkillEntry[] 构建，
+ * 用于 /command 匹配和命令列表展示
  */
 export type SkillCommandSpec = {
   /** 命令名（sanitized，用于 /name 触发） */
@@ -96,43 +98,32 @@ export type SkillCommandSpec = {
  * 对应 OpenClaw: resolveSkillCommandInvocation 的返回值
  */
 export interface SkillMatch {
+  /** 匹配到的命令规格 */
   command: SkillCommandSpec;
+  /** 命令后的参数部分（如 "/commit -m fix" 中的 "-m fix"） */
   args?: string;
 }
 
-// ============== Frontmatter 解析 (对齐 openclaw frontmatter.ts) ==============
+// ============== Frontmatter 解析 (对应 openclaw frontmatter.ts) ==============
 
 /**
- * 解析 YAML frontmatter
+ * 解析 frontmatter 为键值对
  *
- * 对应 OpenClaw: parseFrontmatterBlock()
- * - 简化版: 只解析 key: value 格式
- * - 所有值都转为 string（对齐 openclaw 的 coercion 策略）
+ * 对应 OpenClaw: parseFrontmatter() → parseFrontmatterBlock()
+ * OpenClaw 在 SDK 之外有自己的 frontmatter 解析器，
+ * 用于提取 SDK 不关心的元数据字段（调用策略等）
  */
 function parseFrontmatter(content: string): ParsedSkillFrontmatter {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return {};
-  const block = match[1];
   const result: ParsedSkillFrontmatter = {};
-  for (const line of block.split("\n")) {
+  for (const line of match[1].split("\n")) {
     const kv = line.match(/^([a-zA-Z][\w-]*):\s*(.+)$/);
     if (kv) {
       result[kv[1]] = kv[2].replace(/^["']|["']$/g, "");
     }
   }
   return result;
-}
-
-/**
- * 解析调用策略
- *
- * 对应 OpenClaw: resolveSkillInvocationPolicy()
- */
-function resolveInvocationPolicy(fm: ParsedSkillFrontmatter): SkillInvocationPolicy {
-  return {
-    userInvocable: parseBool(fm["user-invocable"], true),
-    disableModelInvocation: parseBool(fm["disable-model-invocation"], false),
-  };
 }
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
@@ -143,164 +134,86 @@ function parseBool(value: string | undefined, fallback: boolean): boolean {
   return fallback;
 }
 
-// ============== 文件加载 (对齐 pi-coding-agent loadSkillsFromDir) ==============
-
-/**
- * 从目录加载 skills
- *
- * 对应 pi-coding-agent: loadSkillsFromDir()
- * - 根目录: 扫描直属 .md 文件
- * - 子目录: 递归查找 SKILL.md
- * - 跳过 node_modules 和 dotfiles
- */
-async function loadSkillsFromDir(dir: string, source: string): Promise<SkillEntry[]> {
-  const entries: SkillEntry[] = [];
-  let dirEntries: Dirent[];
-  try {
-    dirEntries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return entries;
-  }
-  for (const entry of dirEntries) {
-    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      // 子目录: 查找 SKILL.md
-      const skillPath = path.join(fullPath, "SKILL.md");
-      const loaded = await loadSingleSkillFile(skillPath, fullPath, source);
-      if (loaded) {
-        entries.push(loaded);
-      }
-      // 递归搜索更深层子目录
-      const subEntries = await loadSkillsFromDirRecursive(fullPath, source);
-      entries.push(...subEntries);
-    } else if (entry.name.endsWith(".md")) {
-      // 根目录直属 .md 文件
-      const loaded = await loadSingleSkillFile(fullPath, dir, source);
-      if (loaded) {
-        entries.push(loaded);
-      }
-    }
-  }
-  return entries;
-}
-
-/**
- * 递归扫描子目录中的 SKILL.md（不包含根目录 .md 文件）
- */
-async function loadSkillsFromDirRecursive(dir: string, source: string): Promise<SkillEntry[]> {
-  const entries: SkillEntry[] = [];
-  let dirEntries: Dirent[];
-  try {
-    dirEntries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return entries;
-  }
-  for (const entry of dirEntries) {
-    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-    if (!entry.isDirectory()) continue;
-    const fullPath = path.join(dir, entry.name);
-    const skillPath = path.join(fullPath, "SKILL.md");
-    const loaded = await loadSingleSkillFile(skillPath, fullPath, source);
-    if (loaded) {
-      entries.push(loaded);
-    }
-    const subEntries = await loadSkillsFromDirRecursive(fullPath, source);
-    entries.push(...subEntries);
-  }
-  return entries;
-}
-
-/**
- * 加载单个 SKILL.md 文件
- */
-async function loadSingleSkillFile(
-  filePath: string,
-  baseDir: string,
-  source: string,
-): Promise<SkillEntry | null> {
-  let content: string;
-  try {
-    content = await fs.readFile(filePath, "utf-8");
-  } catch {
-    return null;
-  }
-  const frontmatter = parseFrontmatter(content);
-  const invocation = resolveInvocationPolicy(frontmatter);
-  // name: frontmatter > 父目录名 > 文件名
-  const name = frontmatter.name?.trim()
-    || path.basename(baseDir).toLowerCase()
-    || path.basename(filePath, ".md").toLowerCase();
-  const description = frontmatter.description?.trim() || "";
-  if (!description) return null; // 对齐 pi-coding-agent: description 必填
+/** 对应 OpenClaw: resolveSkillInvocationPolicy() */
+function resolveInvocationPolicy(fm: ParsedSkillFrontmatter): SkillInvocationPolicy {
   return {
-    skill: {
-      name,
-      description,
-      filePath: path.resolve(filePath),
-      baseDir: path.resolve(baseDir),
-      source,
-      disableModelInvocation: invocation.disableModelInvocation,
-    },
-    frontmatter,
-    invocation,
+    userInvocable: parseBool(fm["user-invocable"], true),
+    disableModelInvocation: parseBool(fm["disable-model-invocation"], false),
   };
 }
 
-// ============== Prompt 格式化 (对齐 pi-coding-agent formatSkillsForPrompt) ==============
-
-const XML_ESCAPE_MAP: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" };
-
-function escapeXml(str: string): string {
-  return str.replace(/[&<>"']/g, (ch) => XML_ESCAPE_MAP[ch] ?? ch);
-}
+// ============== Skill 加载与合并 (对应 openclaw workspace.ts) ==============
 
 /**
- * 生成 XML 格式的 skills prompt
+ * 加载 skill 条目（多层合并 + 元数据丰富）
  *
- * 对应 pi-coding-agent: formatSkillsForPrompt()
- * - Agent Skills 标准: https://agentskills.io/integrate-skills
- * - 只包含 disableModelInvocation=false 的 skill
- * - 模型看到描述后通过 read 工具读取 SKILL.md 获取详细指令
+ * 对应 OpenClaw: loadSkillEntries()
+ * 流程:
+ * 1. 调用 SDK 的 loadSkillsFromDir 扫描多个目录 → Skill[]
+ * 2. name-based Map 合并（后加载覆盖先加载）
+ * 3. 重读文件提取编排层的 frontmatter 元数据 → SkillEntry[]
+ *
+ * 这里的「重读文件」对应 OpenClaw workspace.ts:173-188 的做法：
+ * SDK 已经读过一次提取了 name/description，但编排层需要
+ * 提取 SDK 不关心的字段（user-invocable 等），所以再读一次。
  */
-function formatSkillsForPrompt(skills: Skill[]): string {
-  const visible = skills.filter((s) => !s.disableModelInvocation);
-  if (visible.length === 0) return "";
-  const intro =
-    "The following skills provide specialized instructions for specific tasks.\n" +
-    "Use the read tool to load a skill's file when the task matches its description.\n";
-  const items = visible.map(
-    (s) =>
-      `  <skill>\n` +
-      `    <name>${escapeXml(s.name)}</name>\n` +
-      `    <description>${escapeXml(s.description)}</description>\n` +
-      `    <location>${escapeXml(s.filePath)}</location>\n` +
-      `  </skill>`,
-  );
-  return `\n${intro}\n<available_skills>\n${items.join("\n")}\n</available_skills>`;
+async function loadSkillEntries(
+  workspaceDir: string,
+  managedDir: string,
+): Promise<SkillEntry[]> {
+  const merged = new Map<string, Skill>();
+
+  // 优先级: managed < workspace（对应 OpenClaw 的 extra < bundled < managed < workspace）
+  const managedSkills = await loadSkillsFromDir({ dir: managedDir, source: "managed" });
+  for (const skill of managedSkills) {
+    merged.set(skill.name, skill);
+  }
+
+  const workspaceSkillsDir = path.join(workspaceDir, "skills");
+  const workspaceSkills = await loadSkillsFromDir({
+    dir: workspaceSkillsDir,
+    source: "workspace",
+  });
+  for (const skill of workspaceSkills) {
+    merged.set(skill.name, skill);
+  }
+
+  // 丰富为 SkillEntry（重读文件提取编排层元数据）
+  const entries: SkillEntry[] = [];
+  for (const skill of merged.values()) {
+    let frontmatter: ParsedSkillFrontmatter = {};
+    try {
+      const raw = await fs.readFile(skill.filePath, "utf-8");
+      frontmatter = parseFrontmatter(raw);
+    } catch {
+      // ignore
+    }
+    entries.push({
+      skill,
+      frontmatter,
+      invocation: resolveInvocationPolicy(frontmatter),
+    });
+  }
+  return entries;
 }
 
-// ============== 命令名 sanitize (对齐 openclaw workspace.ts) ==============
+// ============== 命令名 sanitize (对应 openclaw workspace.ts) ==============
 
 const COMMAND_MAX_LENGTH = 32;
-const DESCRIPTION_MAX_LENGTH = 100;
+const COMMAND_FALLBACK = "skill";
+const DESCRIPTION_MAX_LENGTH = 100; // Discord limit
 
-/**
- * 对应 OpenClaw: sanitizeSkillCommandName()
- */
+/** 对应 OpenClaw: sanitizeSkillCommandName() */
 function sanitizeCommandName(raw: string): string {
   const normalized = raw
     .toLowerCase()
     .replace(/[^a-z0-9_]+/g, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "");
-  return normalized.slice(0, COMMAND_MAX_LENGTH) || "skill";
+  return normalized.slice(0, COMMAND_MAX_LENGTH) || COMMAND_FALLBACK;
 }
 
-/**
- * 对应 OpenClaw: resolveUniqueSkillCommandName()
- */
+/** 对应 OpenClaw: resolveUniqueSkillCommandName() */
 function resolveUniqueCommandName(base: string, used: Set<string>): string {
   if (!used.has(base.toLowerCase())) return base;
   for (let i = 2; i < 1000; i++) {
@@ -312,43 +225,77 @@ function resolveUniqueCommandName(base: string, used: Set<string>): string {
   return `${base.slice(0, Math.max(1, COMMAND_MAX_LENGTH - 2))}_x`;
 }
 
-// ============== 命令匹配 (对齐 openclaw skill-commands.ts) ==============
+/**
+ * 构建斜杠命令列表
+ *
+ * 对应 OpenClaw: buildWorkspaceSkillCommandSpecs()
+ */
+function buildSkillCommandSpecs(entries: SkillEntry[]): SkillCommandSpec[] {
+  const userInvocable = entries.filter((e) => e.invocation.userInvocable !== false);
+  const used = new Set<string>();
+  const specs: SkillCommandSpec[] = [];
+
+  for (const entry of userInvocable) {
+    const base = sanitizeCommandName(entry.skill.name);
+    const unique = resolveUniqueCommandName(base, used);
+    used.add(unique.toLowerCase());
+
+    const rawDesc = entry.skill.description?.trim() || entry.skill.name;
+    const description =
+      rawDesc.length > DESCRIPTION_MAX_LENGTH
+        ? `${rawDesc.slice(0, DESCRIPTION_MAX_LENGTH - 1)}…`
+        : rawDesc;
+
+    specs.push({ name: unique, skillName: entry.skill.name, description });
+  }
+  return specs;
+}
+
+// ============== 命令匹配 (对应 openclaw skill-commands.ts) ==============
 
 /**
- * 归一化命令名用于模糊匹配
+ * 归一化命令名用于模糊查找
  *
- * 对应 OpenClaw: findSkillCommand 内的 normalize
- * - 小写化，空格/下划线统一转连字符
+ * 对应 OpenClaw: normalizeSkillCommandLookup()
  */
-function normalizeCommandName(raw: string): string {
-  return raw.toLowerCase().replace(/[\s_]+/g, "-");
+function normalizeForLookup(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_]+/g, "-");
 }
 
 /**
- * 查找匹配的命令（3 种策略）
+ * 模糊查找命令（单次遍历，4 种策略）
  *
  * 对应 OpenClaw: findSkillCommand()
- * 1. 精确匹配 name（大小写不敏感）
- * 2. 精确匹配 skillName（大小写不敏感）
- * 3. 归一化匹配（下划线/空格→连字符）
+ * 仅用于 /skill skillname args 路径（允许灵活匹配）
  */
-function findCommand(
+function findSkillCommand(
   commands: SkillCommandSpec[],
   rawName: string,
 ): SkillCommandSpec | undefined {
-  const lower = rawName.toLowerCase();
-  const normalized = normalizeCommandName(rawName);
-  return commands.find((c) => c.name.toLowerCase() === lower)
-    ?? commands.find((c) => c.skillName.toLowerCase() === lower)
-    ?? commands.find((c) => normalizeCommandName(c.name) === normalized);
+  const trimmed = rawName.trim();
+  if (!trimmed) return undefined;
+  const lowered = trimmed.toLowerCase();
+  const normalized = normalizeForLookup(trimmed);
+
+  // 单次遍历，第一个命中任一策略的即返回（对齐 openclaw 实现）
+  return commands.find((entry) => {
+    if (entry.name.toLowerCase() === lowered) return true;
+    if (entry.skillName.toLowerCase() === lowered) return true;
+    return (
+      normalizeForLookup(entry.name) === normalized ||
+      normalizeForLookup(entry.skillName) === normalized
+    );
+  });
 }
 
 /**
+ * 解析斜杠命令
+ *
  * 对应 OpenClaw: resolveSkillCommandInvocation()
  *
- * 支持两种语法:
- * - /skillname args  — 直接触发
- * - /skill skillname args — 显式分发
+ * 两种语法的匹配策略不同（与 openclaw 一致）:
+ * - /skill skillname args → findSkillCommand（灵活匹配 name + skillName + 归一化）
+ * - /skillname args → 严格匹配 command.name only
  */
 function resolveCommandInvocation(
   input: string,
@@ -363,25 +310,24 @@ function resolveCommandInvocation(
   const commandName = match[1]?.trim().toLowerCase();
   if (!commandName) return null;
 
-  // /skill skillname args
+  // /skill skillname args — 灵活匹配
   if (commandName === "skill") {
     const remainder = match[2]?.trim();
     if (!remainder) return null;
     const skillMatch = remainder.match(/^([^\s]+)(?:\s+([\s\S]+))?$/);
     if (!skillMatch) return null;
-    const target = skillMatch[1]?.trim() ?? "";
-    const cmd = findCommand(commands, target);
+    const cmd = findSkillCommand(commands, skillMatch[1] ?? "");
     if (!cmd) return null;
     return { command: cmd, args: skillMatch[2]?.trim() || undefined };
   }
 
-  // /skillname args
-  const cmd = findCommand(commands, commandName);
+  // /skillname args — 严格匹配 name（对齐 openclaw: entry.name.toLowerCase() === commandName）
+  const cmd = commands.find((entry) => entry.name.toLowerCase() === commandName);
   if (!cmd) return null;
   return { command: cmd, args: match[2]?.trim() || undefined };
 }
 
-// ============== SkillManager (对齐 openclaw workspace.ts 的 public API) ==============
+// ============== SkillManager (对应 openclaw workspace.ts 的 public API) ==============
 
 export class SkillManager {
   private workspaceDir: string;
@@ -398,54 +344,24 @@ export class SkillManager {
    */
   constructor(workspaceDir: string, managedDir?: string) {
     this.workspaceDir = workspaceDir;
-    this.managedDir = managedDir ?? path.join(
-      process.env.HOME || process.env.USERPROFILE || ".",
-      ".mini-agent",
-      "skills",
-    );
+    this.managedDir =
+      managedDir ??
+      path.join(
+        process.env.HOME || process.env.USERPROFILE || ".",
+        ".mini-agent",
+        "skills",
+      );
   }
 
   /**
-   * 加载所有 skill（多层覆盖）
+   * 加载所有 skill（多层合并 + 命令列表构建）
    *
-   * 对应 OpenClaw: loadSkillEntries()
-   * 优先级: managed < workspace（后者覆盖前者同名 skill）
+   * 对应 OpenClaw: loadSkillEntries() + buildWorkspaceSkillCommandSpecs()
    */
   async loadAll(): Promise<void> {
     if (this.loaded) return;
-
-    const merged = new Map<string, SkillEntry>();
-
-    // 1. managed skills (~/.mini-agent/skills/)
-    const managedEntries = await loadSkillsFromDir(this.managedDir, "managed");
-    for (const entry of managedEntries) {
-      merged.set(entry.skill.name, entry);
-    }
-
-    // 2. workspace skills (./skills/) — 最高优先级
-    const workspaceSkillsDir = path.join(this.workspaceDir, "skills");
-    const workspaceEntries = await loadSkillsFromDir(workspaceSkillsDir, "workspace");
-    for (const entry of workspaceEntries) {
-      merged.set(entry.skill.name, entry);
-    }
-
-    this.entries = Array.from(merged.values());
-
-    // 构建斜杠命令列表（对齐 buildWorkspaceSkillCommandSpecs）
-    const used = new Set<string>();
-    this.commands = [];
-    for (const entry of this.entries) {
-      if (!entry.invocation.userInvocable) continue;
-      const base = sanitizeCommandName(entry.skill.name);
-      const unique = resolveUniqueCommandName(base, used);
-      used.add(unique.toLowerCase());
-      const rawDesc = entry.skill.description || entry.skill.name;
-      const description = rawDesc.length > DESCRIPTION_MAX_LENGTH
-        ? `${rawDesc.slice(0, DESCRIPTION_MAX_LENGTH - 1)}…`
-        : rawDesc;
-      this.commands.push({ name: unique, skillName: entry.skill.name, description });
-    }
-
+    this.entries = await loadSkillEntries(this.workspaceDir, this.managedDir);
+    this.commands = buildSkillCommandSpecs(this.entries);
     this.loaded = true;
   }
 
@@ -453,33 +369,25 @@ export class SkillManager {
    * 匹配斜杠命令
    *
    * 对应 OpenClaw: resolveSkillCommandInvocation()
-   * 输入 "/review src/index.ts" → 匹配 review skill，args = "src/index.ts"
    */
   async match(input: string): Promise<SkillMatch | null> {
     await this.loadAll();
     return resolveCommandInvocation(input, this.commands);
   }
 
-  /**
-   * 按 name 获取 skill
-   */
+  /** 按 name 获取 skill */
   async get(name: string): Promise<Skill | null> {
     await this.loadAll();
-    const entry = this.entries.find((e) => e.skill.name === name);
-    return entry?.skill ?? null;
+    return this.entries.find((e) => e.skill.name === name)?.skill ?? null;
   }
 
-  /**
-   * 列出所有 skill
-   */
+  /** 列出所有 skill */
   async list(): Promise<Skill[]> {
     await this.loadAll();
     return this.entries.map((e) => e.skill);
   }
 
-  /**
-   * 列出斜杠命令
-   */
+  /** 列出斜杠命令 */
   async listCommands(): Promise<SkillCommandSpec[]> {
     await this.loadAll();
     return this.commands;
@@ -490,7 +398,7 @@ export class SkillManager {
    *
    * 对应 OpenClaw: buildWorkspaceSkillsPrompt() → formatSkillsForPrompt()
    * - 只包含 disableModelInvocation=false 的 skill
-   * - 模型看到后通过 read 工具加载 SKILL.md 获取详细指令
+   * - 调用 SDK 的 formatSkillsForPrompt 生成 XML
    */
   async buildSkillsPrompt(): Promise<string> {
     await this.loadAll();
